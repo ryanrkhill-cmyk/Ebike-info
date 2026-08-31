@@ -1,0 +1,5 @@
+<resources>
+  <string name="app_name">Circular Scroll</string>
+  <string name="service_name">Circular Scroll</string>
+  <string name="service_desc">Spin one finger clockwise to scroll down and counter-clockwise to scroll up.</string>
+</resources>
