@@ -3,8 +3,243 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - run: echo ready
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.5.1'
+
+      - name: Generate Android project
+        shell: bash
+        run: |
+          mkdir -p CircularScroll/app/src/main/java/com/circularscroll/app
+          mkdir -p CircularScroll/app/src/main/res/xml
+          mkdir -p CircularScroll/app/src/main/res/values
+
+          cat > CircularScroll/settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = 'CircularScroll'
+          include ':app'
+          EOF
+
+          cat > CircularScroll/build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '9.3.0' apply false }
+          EOF
+
+          cat > CircularScroll/app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+            namespace 'com.circularscroll.app'
+            compileSdk 36
+            defaultConfig {
+              applicationId 'com.circularscroll.app'
+              minSdk 34
+              targetSdk 36
+              versionCode 2
+              versionName '1.0.1'
+            }
+            compileOptions {
+              sourceCompatibility JavaVersion.VERSION_17
+              targetCompatibility JavaVersion.VERSION_17
+            }
+          }
+          EOF
+
+          cat > CircularScroll/app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+            <string name="app_name">Circular Scroll</string>
+            <string name="service_name">Circular Scroll</string>
+            <string name="service_desc">Spin one finger clockwise to scroll down and counter-clockwise to scroll up.</string>
+          </resources>
+          EOF
+
+          cat > CircularScroll/app/src/main/res/values/styles.xml <<'EOF'
+          <resources>
+            <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+              <item name="android:fontFamily">sans</item>
+              <item name="android:colorAccent">#3F51B5</item>
+            </style>
+          </resources>
+          EOF
+
+          cat > CircularScroll/app/src/main/res/xml/accessibility_service_config.xml <<'EOF'
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+            android:description="@string/service_desc"
+            android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+            android:accessibilityFeedbackType="feedbackGeneric"
+            android:notificationTimeout="50"
+            android:canRetrieveWindowContent="true"
+            android:canPerformGestures="true"
+            android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows" />
+          EOF
+
+          cat > CircularScroll/app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.VIBRATE" />
+            <application android:theme="@style/AppTheme" android:label="Circular Scroll" android:allowBackup="true">
+              <activity android:name=".MainActivity" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+                </intent-filter>
+              </activity>
+              <service android:name=".CircularScrollService" android:exported="true" android:label="Circular Scroll" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                <intent-filter><action android:name="android.accessibilityservice.AccessibilityService" /></intent-filter>
+                <meta-data android:name="android.accessibilityservice" android:resource="@xml/accessibility_service_config" />
+              </service>
+            </application>
+          </manifest>
+          EOF
+
+          cat > CircularScroll/app/src/main/java/com/circularscroll/app/CircularGestureEngine.java <<'EOF'
+          package com.circularscroll.app;
+
+          public final class CircularGestureEngine {
+            public static final class Result {
+              public final boolean engaged;
+              public final double turn;
+              Result(boolean e, double t) { engaged=e; turn=t; }
+            }
+            private final float minSeg, activationPath;
+            private final double activationTurn, consistency, maxTurn;
+            private boolean down, engaged, hasHeading;
+            private float px, py;
+            private double heading, path, signed, absolute;
+
+            public CircularGestureEngine(float density) {
+              minSeg=2.5f*density;
+              activationPath=46f*density;
+              activationTurn=Math.toRadians(45);
+              consistency=.66;
+              maxTurn=Math.toRadians(65);
+            }
+            public void down(float x,float y){ reset(); down=true; px=x; py=y; }
+            public Result move(float x,float y){
+              if(!down){down(x,y);return new Result(false,0);}
+              float dx=x-px,dy=y-py; double d=Math.hypot(dx,dy);
+              if(d<minSeg)return new Result(engaged,0);
+              double h=Math.atan2(dy,dx), delta=0;
+              if(hasHeading){
+                delta=norm(h-heading);
+                if(Math.abs(delta)<=maxTurn){signed+=delta;absolute+=Math.abs(delta);} else delta=0;
+              }
+              path+=d;px=x;py=y;heading=h;hasHeading=true;
+              if(!engaged && absolute>0 && path>=activationPath){
+                if(Math.abs(signed)>=activationTurn && Math.abs(signed)/absolute>=consistency){engaged=true;return new Result(true,0);}
+              }
+              return new Result(engaged,engaged?delta:0);
+            }
+            public void up(){reset();}
+            private void reset(){down=false;engaged=false;hasHeading=false;path=0;signed=0;absolute=0;heading=0;}
+            private static double norm(double a){while(a>Math.PI)a-=Math.PI*2;while(a<-Math.PI)a+=Math.PI*2;return a;}
+          }
+          EOF
+
+          cat > CircularScroll/app/src/main/java/com/circularscroll/app/MainActivity.java <<'EOF'
+          package com.circularscroll.app;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.graphics.Color;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.view.ViewGroup;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+
+          public class MainActivity extends Activity {
+            private int dp(float n){return Math.round(n*getResources().getDisplayMetrics().density);}
+            @Override public void onCreate(Bundle b){super.onCreate(b);
+              ScrollView sv=new ScrollView(this); LinearLayout box=new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); box.setPadding(dp(20),dp(26),dp(20),dp(40)); sv.addView(box,new ScrollView.LayoutParams(-1,-2));
+              TextView title=new TextView(this);title.setText("Circular Scroll");title.setTextSize(30);title.setTextColor(Color.BLACK);box.addView(title);
+              TextView info=new TextView(this);info.setText("1. Tap OPEN ACCESSIBILITY SETTINGS and enable Circular Scroll.\n\n2. A floating ↻ button appears. Tap it to turn circular scrolling ON.\n\n3. Spin one finger clockwise anywhere on the screen to scroll down. Spin counter-clockwise to scroll up. Keep circling without lifting.\n\n4. Tap the floating button again, or touch with a second finger, to turn it OFF.\n\nThis page is intentionally long so you can test it immediately.");info.setTextSize(18);info.setPadding(0,dp(16),0,dp(18));box.addView(info);
+              Button settings=new Button(this);settings.setText("OPEN ACCESSIBILITY SETTINGS");settings.setOnClickListener(v->startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));box.addView(settings,new LinearLayout.LayoutParams(-1,dp(56)));
+              for(int i=1;i<=45;i++){TextView t=new TextView(this);t.setText("Test section "+i+"\nClockwise should move downward. Counter-clockwise should move upward. Reverse direction without lifting your finger to reverse the page.");t.setTextSize(17);t.setPadding(0,dp(18),0,dp(18));box.addView(t,new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,ViewGroup.LayoutParams.WRAP_CONTENT));}
+              setContentView(sv);
+            }
+          }
+          EOF
+
+          cat > CircularScroll/app/src/main/java/com/circularscroll/app/CircularScrollService.java <<'EOF'
+          package com.circularscroll.app;
+
+          import android.accessibilityservice.AccessibilityService;
+          import android.accessibilityservice.AccessibilityServiceInfo;
+          import android.graphics.PixelFormat;
+          import android.graphics.Rect;
+          import android.os.VibrationEffect;
+          import android.os.Vibrator;
+          import android.view.Gravity;
+          import android.view.InputDevice;
+          import android.view.MotionEvent;
+          import android.view.WindowManager;
+          import android.view.accessibility.AccessibilityEvent;
+          import android.view.accessibility.AccessibilityNodeInfo;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          public class CircularScrollService extends AccessibilityService {
+            private WindowManager wm; private TextView bubble; private WindowManager.LayoutParams bp;
+            private CircularGestureEngine engine; private boolean active=false; private float pending=0; private long lastScroll=0;
+            private int size, bx, by;
+            private int dp(float n){return Math.round(n*getResources().getDisplayMetrics().density);}
+
+            @Override protected void onServiceConnected(){
+              engine=new CircularGestureEngine(getResources().getDisplayMetrics().density); wm=(WindowManager)getSystemService(WINDOW_SERVICE); size=dp(62); bx=getResources().getDisplayMetrics().widthPixels-size-dp(14); by=dp(190);
+              bubble=new TextView(this); bubble.setText("↻"); bubble.setTextSize(30); bubble.setGravity(Gravity.CENTER); bubble.setTextColor(0xffffffff); bubble.setBackgroundColor(0xff555555); bubble.setOnClickListener(v->setActive(!active,true));
+              bp=new WindowManager.LayoutParams(size,size,WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,PixelFormat.TRANSLUCENT);bp.gravity=Gravity.TOP|Gravity.LEFT;bp.x=bx;bp.y=by;wm.addView(bubble,bp); setActive(false,false);
+            }
+            private void setActive(boolean on, boolean announce){
+              active=on; pending=0; if(engine!=null)engine.up(); AccessibilityServiceInfo i=getServiceInfo(); i.setMotionEventSources(on?InputDevice.SOURCE_TOUCHSCREEN:0); setServiceInfo(i); if(bubble!=null){bubble.setBackgroundColor(on?0xff3f51b5:0xff555555);bubble.setText(on?"●":"↻");}
+              if(announce){Toast.makeText(this,on?"Circular Scroll ON":"Circular Scroll OFF",Toast.LENGTH_SHORT).show(); try{Vibrator v=(Vibrator)getSystemService(VIBRATOR_SERVICE);v.vibrate(VibrationEffect.createOneShot(35,VibrationEffect.DEFAULT_AMPLITUDE));}catch(Exception ignored){}}
+            }
+            private boolean inBubble(float x,float y){return x>=bx-dp(12)&&x<=bx+size+dp(12)&&y>=by-dp(12)&&y<=by+size+dp(12);}
+            @Override public void onMotionEvent(MotionEvent e){
+              if(!active||e==null)return; if(e.getPointerCount()>1||e.getActionMasked()==MotionEvent.ACTION_POINTER_DOWN){setActive(false,true);return;} float x=e.getRawX(),y=e.getRawY();
+              switch(e.getActionMasked()){
+                case MotionEvent.ACTION_DOWN: if(inBubble(x,y)){pending=999;return;} pending=0;engine.down(x,y);break;
+                case MotionEvent.ACTION_MOVE: if(pending==999)return; CircularGestureEngine.Result r=engine.move(x,y); if(r.engaged&&r.turn!=0){pending+=(float)r.turn; maybeScroll(e.getEventTime(),x,y);} break;
+                case MotionEvent.ACTION_UP: if(pending==999&&inBubble(x,y)){setActive(false,true);return;} pending=0;engine.up();break;
+                case MotionEvent.ACTION_CANCEL: pending=0;engine.up();break;
+              }
+            }
+            private void maybeScroll(long now,float x,float y){if(Math.abs(pending)<0.11f||now-lastScroll<55)return;int dir=pending>0?1:-1;if(scrollAtPoint(getRootInActiveWindow(),x,y,dir,0)){pending-=dir*.11f;lastScroll=now;}}
+            private boolean scrollAtPoint(AccessibilityNodeInfo n,float x,float y,int dir,int depth){if(n==null||depth>40)return false;Rect r=new Rect();n.getBoundsInScreen(r);if(!r.contains((int)x,(int)y)&&depth==0){} for(int k=0;k<n.getChildCount();k++){AccessibilityNodeInfo c=n.getChild(k);if(c!=null){Rect cr=new Rect();c.getBoundsInScreen(cr);if(cr.contains((int)x,(int)y)&&scrollAtPoint(c,x,y,dir,depth+1))return true;}}
+              int a=dir>0?AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_DOWN.getId():AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_UP.getId(); if(has(n,a)&&n.performAction(a))return true; int f=dir>0?AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_FORWARD.getId():AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_BACKWARD.getId(); return has(n,f)&&n.performAction(f);
+            }
+            private boolean has(AccessibilityNodeInfo n,int id){for(AccessibilityNodeInfo.AccessibilityAction a:n.getActionList())if(a.getId()==id)return true;return false;}
+            @Override public void onAccessibilityEvent(AccessibilityEvent e){}
+            @Override public void onInterrupt(){setActive(false,false);}
+            @Override public void onDestroy(){setActive(false,false);if(wm!=null&&bubble!=null)try{wm.removeView(bubble);}catch(Exception ignored){}super.onDestroy();}
+          }
+          EOF
+
+      - name: Build debug APK
+        working-directory: CircularScroll
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify APK
+        run: |
+          test -f CircularScroll/app/build/outputs/apk/debug/app-debug.apk
+          $ANDROID_HOME/build-tools/36.0.0/aapt dump badging CircularScroll/app/build/outputs/apk/debug/app-debug.apk | head -20
+          sha256sum CircularScroll/app/build/outputs/apk/debug/app-debug.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CircularScroll-APK
+          path: CircularScroll/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
