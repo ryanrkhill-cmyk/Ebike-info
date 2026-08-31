@@ -2,16 +2,23 @@ package com.circularscroll.app;
 
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.AccessibilityServiceInfo;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
 import android.graphics.drawable.GradientDrawable;
-import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
+import android.view.Choreographer;
 import android.view.Gravity;
 import android.view.InputDevice;
+import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
@@ -24,11 +31,12 @@ import android.widget.Toast;
 import java.util.List;
 
 public class CircularScrollService extends AccessibilityService {
-  // About 1.65 visible screen-heights per complete finger circle.
-  // This keeps the page connected to finger rotation without feeling twitchy.
-  private static final float SCREENS_PER_RADIAN = 1.65f / (float) (Math.PI * 2.0);
-  private static final float MAX_GRANULAR_AMOUNT = 0.09f;
-  private static final float FALLBACK_STEP_RADIANS = 0.30f;
+  private static final float MIN_PENDING_PX = 0.20f;
+  private static final float MAX_FRAME_SCROLL_DP = 72f;
+  private static final float MAX_PENDING_PX = 1800f;
+  private static final float MAX_GRANULAR_FRACTION = 0.10f;
+  private static final float LEGACY_TRIGGER_SCREEN_FRACTION = 0.45f;
+  private static final long EMERGENCY_HOLD_MS = 900L;
 
   private WindowManager windowManager;
   private FrameLayout hitTarget;
@@ -38,26 +46,68 @@ public class CircularScrollService extends AccessibilityService {
 
   private boolean active;
   private boolean touchStartedOnButton;
-  private float pendingTurn;
-  private float fallbackTurn;
-  private long lastScrollTime;
+  private float pendingPx;
+  private float anchorX;
+  private float anchorY;
+  private boolean framePosted;
 
   private int hitSize;
   private int buttonX;
   private int buttonY;
 
+  private final Handler mainHandler = new Handler(Looper.getMainLooper());
+  private boolean volumeUpDown;
+  private boolean volumeDownDown;
+  private boolean volumeShortcutSession;
+  private boolean emergencyPosted;
+  private boolean receiverRegistered;
+
+  private final Runnable emergencyKill = () -> {
+    emergencyPosted = false;
+    if (active && volumeUpDown && volumeDownDown) {
+      setActive(false, true);
+      Toast.makeText(this, "Circular Scroll EMERGENCY OFF", Toast.LENGTH_SHORT).show();
+    }
+  };
+
+  private final BroadcastReceiver screenReceiver = new BroadcastReceiver() {
+    @Override
+    public void onReceive(Context context, Intent intent) {
+      if (Intent.ACTION_SCREEN_OFF.equals(intent.getAction())) {
+        setActive(false, false);
+      }
+    }
+  };
+
+  private final Choreographer.FrameCallback frameCallback = frameTimeNanos -> {
+    framePosted = false;
+    if (!active) return;
+    performScrollFrame();
+    if (Math.abs(pendingPx) >= MIN_PENDING_PX) postFrame();
+  };
+
   private int dp(float value) {
     return Math.round(value * getResources().getDisplayMetrics().density);
   }
 
+  private float dpFloat(float value) {
+    return value * getResources().getDisplayMetrics().density;
+  }
+
   @Override
   protected void onServiceConnected() {
+    super.onServiceConnected();
+
     float density = getResources().getDisplayMetrics().density;
-    engine = new CircularGestureEngine(density);
+    engine = new CircularGestureEngine(
+        0.35f * density,
+        16f * density,
+        Math.toRadians(14),
+        0.48,
+        Math.toRadians(72));
+
     windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
 
-    // Visually this is a tiny 12dp dot, close to the Wispr Flow shortcut shown
-    // in the reference screenshot. The transparent 48dp container is the tap target.
     hitSize = dp(48);
     int dotSize = dp(12);
     buttonX = getResources().getDisplayMetrics().widthPixels - hitSize - dp(4);
@@ -85,6 +135,16 @@ public class CircularScrollService extends AccessibilityService {
     overlayParams.y = buttonY;
     windowManager.addView(hitTarget, overlayParams);
 
+    AccessibilityServiceInfo info = getServiceInfo();
+    if (info != null) {
+      info.flags |= AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS;
+      setServiceInfo(info);
+    }
+
+    IntentFilter filter = new IntentFilter(Intent.ACTION_SCREEN_OFF);
+    registerReceiver(screenReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+    receiverRegistered = true;
+
     setActive(false, false);
   }
 
@@ -97,24 +157,32 @@ public class CircularScrollService extends AccessibilityService {
 
   private void setActive(boolean on, boolean announce) {
     active = on;
-    pendingTurn = 0;
-    fallbackTurn = 0;
+    pendingPx = 0f;
     touchStartedOnButton = false;
-    if (engine != null) engine.up();
+    if (engine != null) engine.reset();
+    if (!on) cancelFrame();
+
+    if (!on && emergencyPosted) {
+      mainHandler.removeCallbacks(emergencyKill);
+      emergencyPosted = false;
+    }
 
     AccessibilityServiceInfo info = getServiceInfo();
-    info.setMotionEventSources(on ? InputDevice.SOURCE_TOUCHSCREEN : 0);
-    setServiceInfo(info);
-
-    if (statusDot != null) {
-      statusDot.setBackground(circleDrawable(on));
+    if (info != null) {
+      info.setMotionEventSources(on ? InputDevice.SOURCE_TOUCHSCREEN : 0);
+      info.flags |= AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS;
+      setServiceInfo(info);
     }
+
+    if (statusDot != null) statusDot.setBackground(circleDrawable(on));
 
     if (announce) {
       Toast.makeText(this, on ? "Circular Scroll ON" : "Circular Scroll OFF", Toast.LENGTH_SHORT).show();
       try {
         Vibrator vibrator = (Vibrator) getSystemService(VIBRATOR_SERVICE);
-        vibrator.vibrate(VibrationEffect.createOneShot(30, VibrationEffect.DEFAULT_AMPLITUDE));
+        if (vibrator != null) {
+          vibrator.vibrate(VibrationEffect.createOneShot(30, VibrationEffect.DEFAULT_AMPLITUDE));
+        }
       } catch (Exception ignored) {
       }
     }
@@ -126,30 +194,34 @@ public class CircularScrollService extends AccessibilityService {
 
   @Override
   public void onMotionEvent(MotionEvent event) {
-    if (!active || event == null) return;
+    super.onMotionEvent(event);
+    if (!active || event == null || engine == null) return;
 
-    if (event.getPointerCount() > 1 || event.getActionMasked() == MotionEvent.ACTION_POINTER_DOWN) {
+    int action = event.getActionMasked();
+
+    if (action == MotionEvent.ACTION_POINTER_DOWN || event.getPointerCount() >= 2) {
       setActive(false, true);
       return;
     }
 
     float x = event.getRawX();
     float y = event.getRawY();
+    anchorX = x;
+    anchorY = y;
 
-    switch (event.getActionMasked()) {
+    switch (action) {
       case MotionEvent.ACTION_DOWN:
         touchStartedOnButton = inButton(x, y);
-        pendingTurn = 0;
-        fallbackTurn = 0;
-        if (!touchStartedOnButton) engine.down(x, y);
+        pendingPx = 0f;
+        if (!touchStartedOnButton) engine.onDown(x, y);
         break;
 
       case MotionEvent.ACTION_MOVE:
         if (touchStartedOnButton) return;
-        CircularGestureEngine.Result result = engine.move(x, y);
-        if (result.engaged && result.turn != 0) {
-          pendingTurn += (float) result.turn;
-          maybeScroll(event.getEventTime(), x, y);
+        CircularGestureEngine.MoveResult result = engine.onMove(x, y);
+        if (result.engaged && result.signedPathPx != 0f) {
+          pendingPx = clamp(pendingPx + result.signedPathPx, -MAX_PENDING_PX, MAX_PENDING_PX);
+          postFrame();
         }
         break;
 
@@ -172,142 +244,162 @@ public class CircularScrollService extends AccessibilityService {
 
   private void resetGesture() {
     touchStartedOnButton = false;
-    pendingTurn = 0;
-    fallbackTurn = 0;
-    if (engine != null) engine.up();
+    pendingPx = 0f;
+    if (engine != null) engine.onUp();
+    cancelFrame();
   }
 
-  private void maybeScroll(long now, float x, float y) {
-    // Let several high-frequency touch samples collect for one display frame.
-    if (now - lastScrollTime < 12 || Math.abs(pendingTurn) < 0.003f) return;
+  private void postFrame() {
+    if (framePosted || !active) return;
+    framePosted = true;
+    Choreographer.getInstance().postFrameCallback(frameCallback);
+  }
 
-    float turn = pendingTurn;
-    int direction = turn > 0 ? 1 : -1;
-    float granularAmount = Math.min(MAX_GRANULAR_AMOUNT, Math.abs(turn) * SCREENS_PER_RADIAN);
+  private void cancelFrame() {
+    if (!framePosted) return;
+    Choreographer.getInstance().removeFrameCallback(frameCallback);
+    framePosted = false;
+  }
 
-    if (Build.VERSION.SDK_INT >= 35 && granularAmount > 0 && granularScrollAnyWindow(x, y, direction, granularAmount)) {
-      pendingTurn = 0;
-      fallbackTurn = 0;
-      lastScrollTime = now;
-      return;
+  private void performScrollFrame() {
+    if (Math.abs(pendingPx) < MIN_PENDING_PX) return;
+
+    int direction = pendingPx > 0f ? 1 : -1;
+    float requestedPx = Math.min(Math.abs(pendingPx), dpFloat(MAX_FRAME_SCROLL_DP));
+    float consumedPx = granularScrollAnyWindow(anchorX, anchorY, direction, requestedPx);
+
+    if (consumedPx <= 0f) {
+      consumedPx = discreteFallbackAnyWindow(anchorX, anchorY, direction, requestedPx);
     }
 
-    // Older/non-granular apps still get the original accessibility scroll fallback.
-    // It is intentionally much less frequent, because full-step actions are chunky.
-    fallbackTurn += turn;
-    pendingTurn = 0;
-    if (Math.abs(fallbackTurn) >= FALLBACK_STEP_RADIANS && now - lastScrollTime >= 45) {
-      int fallbackDirection = fallbackTurn > 0 ? 1 : -1;
-      if (discreteScrollAnyWindow(x, y, fallbackDirection)) {
-        fallbackTurn -= fallbackDirection * FALLBACK_STEP_RADIANS;
-        lastScrollTime = now;
-      }
+    if (consumedPx > 0f) {
+      pendingPx -= direction * consumedPx;
+      if (Math.signum(pendingPx) != direction) pendingPx = 0f;
     }
   }
 
-  private boolean granularScrollAnyWindow(float x, float y, int direction, float amount) {
+  private float granularScrollAnyWindow(float x, float y, int direction, float availablePx) {
     AccessibilityNodeInfo activeRoot = getRootInActiveWindow();
-    if (granularScrollAtPoint(activeRoot, x, y, direction, amount, 0)) return true;
+    float consumed = granularScrollAtPoint(activeRoot, x, y, direction, availablePx, 0);
+    if (consumed > 0f) return consumed;
 
     List<AccessibilityWindowInfo> windows = getWindows();
     if (windows != null) {
       for (AccessibilityWindowInfo window : windows) {
         AccessibilityNodeInfo root = window.getRoot();
-        if (root != null && root != activeRoot && granularScrollAtPoint(root, x, y, direction, amount, 0)) {
-          return true;
+        if (root != null && root != activeRoot) {
+          consumed = granularScrollAtPoint(root, x, y, direction, availablePx, 0);
+          if (consumed > 0f) return consumed;
         }
       }
     }
-    return false;
+    return 0f;
   }
 
-  private boolean granularScrollAtPoint(
+  private float granularScrollAtPoint(
       AccessibilityNodeInfo node,
       float x,
       float y,
       int direction,
-      float amount,
-      int depth
-  ) {
-    if (node == null || depth > 45) return false;
+      float availablePx,
+      int depth) {
+    if (node == null || depth > 45) return 0f;
 
-    // Prefer the deepest element under the thumb, then walk back toward its parents.
+    Rect bounds = new Rect();
+    node.getBoundsInScreen(bounds);
+    if (!bounds.contains(Math.round(x), Math.round(y))) return 0f;
+
     for (int i = 0; i < node.getChildCount(); i++) {
       AccessibilityNodeInfo child = node.getChild(i);
       if (child == null) continue;
-      Rect bounds = new Rect();
-      child.getBoundsInScreen(bounds);
-      if (bounds.contains((int) x, (int) y)
-          && granularScrollAtPoint(child, x, y, direction, amount, depth + 1)) {
-        return true;
-      }
+      float consumed = granularScrollAtPoint(child, x, y, direction, availablePx, depth + 1);
+      if (consumed > 0f) return consumed;
     }
 
-    if (Build.VERSION.SDK_INT < 35 || !node.isGranularScrollingSupported()) return false;
+    if (android.os.Build.VERSION.SDK_INT < 35 || !node.isGranularScrollingSupported()) return 0f;
+
+    int directionalAction = direction > 0
+        ? AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_DOWN.getId()
+        : AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_UP.getId();
+    int relativeAction = direction > 0
+        ? AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_FORWARD.getId()
+        : AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_BACKWARD.getId();
+
+    boolean directional = hasAction(node, directionalAction);
+    boolean relative = hasAction(node, relativeAction);
+    if (!directional && !relative) return 0f;
+
+    int viewportPx = Math.max(1, bounds.height());
+    float amount = Math.min(availablePx / viewportPx, MAX_GRANULAR_FRACTION);
+    if (amount <= 0f) return 0f;
 
     Bundle arguments = new Bundle();
     arguments.putFloat(AccessibilityNodeInfo.ACTION_ARGUMENT_SCROLL_AMOUNT_FLOAT, amount);
 
-    int directionalAction = direction > 0
-        ? AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_DOWN.getId()
-        : AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_UP.getId();
-    if (hasAction(node, directionalAction) && node.performAction(directionalAction, arguments)) {
-      return true;
+    if (directional && node.performAction(directionalAction, arguments)) {
+      return Math.min(availablePx, amount * viewportPx);
     }
-
-    int relativeAction = direction > 0
-        ? AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_FORWARD.getId()
-        : AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_BACKWARD.getId();
-    return hasAction(node, relativeAction) && node.performAction(relativeAction, arguments);
+    if (relative && node.performAction(relativeAction, arguments)) {
+      return Math.min(availablePx, amount * viewportPx);
+    }
+    return 0f;
   }
 
-  private boolean discreteScrollAnyWindow(float x, float y, int direction) {
+  private float discreteFallbackAnyWindow(float x, float y, int direction, float availablePx) {
     AccessibilityNodeInfo activeRoot = getRootInActiveWindow();
-    if (discreteScrollAtPoint(activeRoot, x, y, direction, 0)) return true;
+    float consumed = discreteFallbackAtPoint(activeRoot, x, y, direction, availablePx, 0);
+    if (consumed > 0f) return consumed;
 
     List<AccessibilityWindowInfo> windows = getWindows();
     if (windows != null) {
       for (AccessibilityWindowInfo window : windows) {
         AccessibilityNodeInfo root = window.getRoot();
-        if (root != null && root != activeRoot && discreteScrollAtPoint(root, x, y, direction, 0)) {
-          return true;
+        if (root != null && root != activeRoot) {
+          consumed = discreteFallbackAtPoint(root, x, y, direction, availablePx, 0);
+          if (consumed > 0f) return consumed;
         }
       }
     }
-    return false;
+    return 0f;
   }
 
-  private boolean discreteScrollAtPoint(
+  private float discreteFallbackAtPoint(
       AccessibilityNodeInfo node,
       float x,
       float y,
       int direction,
-      int depth
-  ) {
-    if (node == null || depth > 45) return false;
+      float availablePx,
+      int depth) {
+    if (node == null || depth > 45) return 0f;
+
+    Rect bounds = new Rect();
+    node.getBoundsInScreen(bounds);
+    if (!bounds.contains(Math.round(x), Math.round(y))) return 0f;
 
     for (int i = 0; i < node.getChildCount(); i++) {
       AccessibilityNodeInfo child = node.getChild(i);
       if (child == null) continue;
-      Rect bounds = new Rect();
-      child.getBoundsInScreen(bounds);
-      if (bounds.contains((int) x, (int) y)
-          && discreteScrollAtPoint(child, x, y, direction, depth + 1)) {
-        return true;
-      }
+      float consumed = discreteFallbackAtPoint(child, x, y, direction, availablePx, depth + 1);
+      if (consumed > 0f) return consumed;
     }
+
+    int viewportPx = Math.max(1, bounds.height());
+    if (availablePx / viewportPx < LEGACY_TRIGGER_SCREEN_FRACTION) return 0f;
 
     int directionalAction = direction > 0
         ? AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_DOWN.getId()
         : AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_UP.getId();
-    if (hasAction(node, directionalAction) && node.performAction(directionalAction)) {
-      return true;
-    }
-
     int relativeAction = direction > 0
         ? AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_FORWARD.getId()
         : AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_BACKWARD.getId();
-    return hasAction(node, relativeAction) && node.performAction(relativeAction);
+
+    if (hasAction(node, directionalAction) && node.performAction(directionalAction)) {
+      return LEGACY_TRIGGER_SCREEN_FRACTION * viewportPx;
+    }
+    if (hasAction(node, relativeAction) && node.performAction(relativeAction)) {
+      return LEGACY_TRIGGER_SCREEN_FRACTION * viewportPx;
+    }
+    return 0f;
   }
 
   private boolean hasAction(AccessibilityNodeInfo node, int actionId) {
@@ -315,6 +407,41 @@ public class CircularScrollService extends AccessibilityService {
       if (action.getId() == actionId) return true;
     }
     return false;
+  }
+
+  @Override
+  protected boolean onKeyEvent(KeyEvent event) {
+    if (event == null) return false;
+    int code = event.getKeyCode();
+    if (code != KeyEvent.KEYCODE_VOLUME_UP && code != KeyEvent.KEYCODE_VOLUME_DOWN) return false;
+
+    if (!active && !volumeShortcutSession) return false;
+
+    boolean down = event.getAction() == KeyEvent.ACTION_DOWN;
+    if (active && down) volumeShortcutSession = true;
+    if (!volumeShortcutSession) return false;
+
+    if (code == KeyEvent.KEYCODE_VOLUME_UP) volumeUpDown = down;
+    if (code == KeyEvent.KEYCODE_VOLUME_DOWN) volumeDownDown = down;
+
+    if (active && volumeUpDown && volumeDownDown) {
+      if (!emergencyPosted) {
+        emergencyPosted = true;
+        mainHandler.postDelayed(emergencyKill, EMERGENCY_HOLD_MS);
+      }
+    } else if (emergencyPosted) {
+      mainHandler.removeCallbacks(emergencyKill);
+      emergencyPosted = false;
+    }
+
+    if (!volumeUpDown && !volumeDownDown && event.getAction() == KeyEvent.ACTION_UP) {
+      volumeShortcutSession = false;
+    }
+    return true;
+  }
+
+  private static float clamp(float value, float min, float max) {
+    return Math.max(min, Math.min(max, value));
   }
 
   @Override
@@ -329,6 +456,17 @@ public class CircularScrollService extends AccessibilityService {
   @Override
   public void onDestroy() {
     setActive(false, false);
+    mainHandler.removeCallbacks(emergencyKill);
+    cancelFrame();
+
+    if (receiverRegistered) {
+      try {
+        unregisterReceiver(screenReceiver);
+      } catch (Exception ignored) {
+      }
+      receiverRegistered = false;
+    }
+
     if (windowManager != null && hitTarget != null) {
       try {
         windowManager.removeView(hitTarget);
