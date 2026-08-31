@@ -5,4 +5,5 @@
   android:notificationTimeout="16"
   android:canRetrieveWindowContent="true"
   android:canPerformGestures="true"
-  android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows" />
+  android:canRequestFilterKeyEvents="true"
+  android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagRequestFilterKeyEvents" />
