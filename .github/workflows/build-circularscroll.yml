@@ -1,7 +1,7 @@
-name: Build CircularScroll v1.3 APK
+name: Build CircularScroll v1.4 APK
 on:
   push:
-    branches: [ circularscroll-v1.3-build ]
+    branches: [ circularscroll-v1.4-build ]
   workflow_dispatch:
 
 jobs:
@@ -24,17 +24,47 @@ jobs:
         with:
           gradle-version: '9.5.1'
 
+      - name: Apply v1.4 scroll-output fix
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          gradle = Path('CircularScroll/app/build.gradle')
+          s = gradle.read_text()
+          s = s.replace("versionCode 13", "versionCode 14")
+          s = s.replace("versionName '1.3.0'", "versionName '1.4.0'")
+          gradle.write_text(s)
+
+          service = Path('CircularScroll/app/src/main/java/com/circularscroll/app/CircularScrollService.java')
+          s = service.read_text()
+          old = 'consumedPx = discreteFallbackAnyWindow(anchorX, anchorY, direction, requestedPx);'
+          new = 'consumedPx = discreteFallbackAnyWindow(anchorX, anchorY, direction, Math.abs(pendingPx));'
+          if old not in s:
+              raise SystemExit('Expected v1.3 fallback call not found')
+          s = s.replace(old, new)
+          s = s.replace('private static final float LEGACY_TRIGGER_SCREEN_FRACTION = 0.45f;',
+                        'private static final float LEGACY_TRIGGER_SCREEN_FRACTION = 0.30f;')
+          service.write_text(s)
+          PY
+
+      - name: Assert v1.4 fallback fix is present
+        run: |
+          grep -q 'versionCode 14' CircularScroll/app/build.gradle
+          grep -q "versionName '1.4.0'" CircularScroll/app/build.gradle
+          grep -q 'discreteFallbackAnyWindow(anchorX, anchorY, direction, Math.abs(pendingPx))' CircularScroll/app/src/main/java/com/circularscroll/app/CircularScrollService.java
+          grep -q 'LEGACY_TRIGGER_SCREEN_FRACTION = 0.30f' CircularScroll/app/src/main/java/com/circularscroll/app/CircularScrollService.java
+
       - name: Build and lint APK
         working-directory: CircularScroll
         run: gradle --no-daemon :app:assembleDebug :app:lintDebug
 
-      - name: Verify v1.3 APK package, permissions and signature
+      - name: Verify v1.4 APK package, permissions and signature
         run: |
           APK=CircularScroll/app/build/outputs/apk/debug/app-debug.apk
           test -f "$APK"
           $ANDROID_HOME/build-tools/36.0.0/aapt dump badging "$APK" | tee /tmp/badging.txt
-          grep -q "versionCode='13'" /tmp/badging.txt
-          grep -q "versionName='1.3.0'" /tmp/badging.txt
+          grep -q "versionCode='14'" /tmp/badging.txt
+          grep -q "versionName='1.4.0'" /tmp/badging.txt
           $ANDROID_HOME/build-tools/36.0.0/aapt dump permissions "$APK" | tee /tmp/permissions.txt
           if grep -q android.permission.INTERNET /tmp/permissions.txt; then
             echo "Unexpected INTERNET permission" >&2
@@ -45,6 +75,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: CircularScroll-v1.3.0-APK
+          name: CircularScroll-v1.4.0-APK
           path: CircularScroll/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
